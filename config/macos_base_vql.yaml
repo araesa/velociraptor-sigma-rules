@@ -117,16 +117,6 @@ ExportTemplate: |
 
     LET Hostname <= dict(H={ SELECT Hostname FROM info()}).H[0].Hostname
 
-    LET _AllProcs <= SELECT Pid, Ppid, Name, Exe,
-          CommandLine, Username, CreateTime
-    FROM pslist()
-
-    LET _ProcLookup <= to_dict(item={
-      SELECT str(str=Pid) AS _key,
-             dict(Exe=Exe, CommandLine=CommandLine) AS _value
-      FROM _AllProcs
-    })
-
     {{ if .LogSources }}
     LET LogSources <= sigma_log_sources(
     {{ range .LogSources }}
@@ -161,6 +151,8 @@ FieldMappings:
   CommandLine: "x=>x.EventData.CommandLine"
   ParentImage: "x=>x.EventData.ParentImage"
   ParentCommandLine: "x=>x.EventData.ParentCommandLine"
+  GrandParentImage: "x=>x.EventData.GrandParentImage"
+  GrandParentCommandLine: "x=>x.EventData.GrandParentCommandLine"
 
 
 DefaultDetails:
@@ -245,24 +237,12 @@ Sources:
 
   process_creation/macos/*:
     description: |
-      Lists all running processes using pslist() and looks up each parent
-      process by Ppid. Returns one row per process.
-
-      This captures a snapshot at the time of collection, not a continuous
-      stream. Processes that start and stop quickly may not appear in the
-      results.
-
-      Unlike Windows (Event Logs) or Linux (auditd), macOS does not keep a
-      history of process creation. The Unified Log does not include command-line
-      arguments for executed processes.
-
-      Future work: 
-      - ESF-based real-time monitoring for event-stream coverage
-        similar to Windows ETW and Linux eBPF.
-      - Shell history (~/.zsh_history, ~/.bash_history) as a
-        complementary log source for historical interactive commands. Covers
-        typed commands with timestamps but not non-interactive processes
-        (LaunchDaemons, cron, GUI apps).
+      Uses the Velociraptor process tracker to list processes and resolve
+      parent/grandparent call chains. When the process tracker is enabled (via a
+      client monitoring artifact), this includes historical processes that have
+      already exited. When the tracker is not enabled, process_tracker_pslist()
+      degrades to pslist() behaviour (snapshot of currently running processes
+      only), and parent/grandparent fields will be empty.
 
     query: |
       SELECT CreateTime AS Timestamp,
@@ -272,15 +252,24 @@ Sources:
                CommandLine=CommandLine,
                Image=Exe,
                Pid=Pid,
-               ParentCommandLine=get(item=_ProcLookup,
-                   member=str(str=Ppid)).CommandLine,
-               ParentImage=get(item=_ProcLookup,
-                   member=str(str=Ppid)).Exe,
+               ParentCommandLine=P.CommandLine,
+               ParentImage=P.Exe,
+               GrandParentCommandLine=GP.CommandLine,
+               GrandParentImage=GP.Exe,
                User=Username
              ) AS EventData
-      FROM _AllProcs
+      FROM foreach(row={
+        SELECT StartTime AS CreateTime,
+            Pid, CommandLine, Exe,
+            process_tracker_get(id=Ppid).Data AS P,
+            process_tracker_get(id=process_tracker_get(id=Ppid).ParentId).Data AS GP,
+            Username
+        FROM process_tracker_pslist()
+      })
     fields:
       - CommandLine
+      - GrandParentCommandLine
+      - GrandParentImage
       - Image
       - ParentCommandLine
       - ParentImage
